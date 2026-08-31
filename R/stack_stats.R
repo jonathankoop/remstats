@@ -85,6 +85,27 @@ if (!exists("%||%")) {
   rs
 }
 
+# 'stats' and 'reh' must describe the same event sequence: attr(stats, "subset")
+# indexes events in reh, so the last row of stats has to exist there. A mismatch
+# - a stale 'stats' object, or a 'reh' rebuilt after the statistics were
+# computed - otherwise surfaces as an opaque 'subscript out of bounds' from
+# inside an lapply, or, on the sampled path, as silent NA offsets. The event
+# count is skipped when it cannot be determined.
+.check_stats_reh <- function(E, subset_idx, n_events) {
+  if (length(subset_idx) != 2L || anyNA(subset_idx))
+    stop("stack_stats(): attr(stats, 'subset') is missing or malformed. ",
+         "Recompute the statistics with remstats().", call. = FALSE)
+  if (!length(n_events) || anyNA(n_events)) return(invisible(TRUE))
+  if (subset_idx[1] + E - 1L > n_events)
+    stop(sprintf(paste0(
+      "stack_stats(): 'stats' and 'reh' do not match. 'stats' has %d row(s) ",
+      "covering events %d-%d, but this 'reh' holds %d event(s). Recompute the ",
+      "statistics from this 'reh', or pass the 'reh' that the statistics were ",
+      "computed with."),
+      E, subset_idx[1], subset_idx[1] + E - 1L, n_events), call. = FALSE)
+  invisible(TRUE)
+}
+
 #' @export
 #' @method stack_stats tomstats
 stack_stats.tomstats <- function(stats, reh, add_actors = TRUE) {
@@ -137,6 +158,8 @@ stack_stats.tomstats <- function(stats, reh, add_actors = TRUE) {
     }
   }
 
+  .check_stats_reh(E, subset_idx, length(dyad_vec))
+
   stat_glm$obs <- unlist(lapply(seq_len(E), function(e) {
     ev_idx <- subset_idx[1] + e - 1L
     obs_dyad <- dyad_vec[[ev_idx]]   # [[ ]] handles both scalar (thin=1) and vector (thin>1)
@@ -157,9 +180,11 @@ stack_stats.tomstats <- function(stats, reh, add_actors = TRUE) {
   	}
   }
   
+  # `type` is a riskset LABEL column added by add_actors, not a statistic:
+  # it must stay out of stat_names, or remstimate() on a pre-stacked object
+  # picks it up as a covariate (typeX dummies) and the fit no longer matches
+  # the one from the unstacked stats.
   reserved <- c("time_index", "obs", "log_interevent", "dyad", "actor1", "actor2", "type")
-
-  reserved <- c("time_index", "obs", "log_interevent", "dyad", "actor1", "actor2")
   structure(
     list(
       remstats_stack = stat_glm,
@@ -212,6 +237,8 @@ stack_stats.tomstats_sampled <- function(stats, reh, add_actors = TRUE) {
   }
 
   # ── Response: 1 for case, 0 for control ──────────────────────────────────────
+  .check_stats_reh(E, subset_idx, reh$M %||% attr(reh, "M"))
+
   stat_glm$obs <- unlist(lapply(seq_len(E), function(e) {
     is_case <- integer(S)
     cp <- case_pos[[e]]  # 1-based case positions
@@ -500,10 +527,28 @@ stack_stats.remstats_durem <- function(stats, reh, add_actors = TRUE) {
 	ext_by_type <- isTRUE(reh$meta$with_type_riskset)
 	has_types   <- "type" %in% names(edgelist)
 	
-	# ── Riskset lookup from reh$riskset_info$included ────────────────────────
-	# Row order in 'included' = column order in the stats arrays.
-	# Works for saturated, active, and manual risksets.
-	incl <- reh$riskset_info$included
+	# ── Riskset lookup for the START columns ─────────────────────────────────
+	# The authoritative riskset for `ss` is the one remstats attached to
+	# start_stats itself: its row order == the column order of `ss`, and its
+	# row count == ncol(ss) (= D_s). Use it. `reh$riskset_info$included` is the
+	# durem reh's *global* riskset and does NOT match the start-model column
+	# space when the start and end processes differ in directedness (e.g.
+	# directed start + undirected end): there nrow(included) exceeds D_s, so the
+	# `d` index runs past dim(ss)[2] and `ss[m, d, ]` throws
+	# "subscript out of bounds". Fall back to the global riskset only when the
+	# attribute is unavailable (e.g. end-only models, where `ss` is NULL and the
+	# start riskset is never indexed).
+	.rename_rs <- function(rs) {
+		if (is.null(rs)) return(NULL)
+		rs <- as.data.frame(rs, stringsAsFactors = FALSE)
+		names(rs)[names(rs) == "sender"]   <- "actor1"
+		names(rs)[names(rs) == "receiver"] <- "actor2"
+		rs
+	}
+	incl <- NULL
+	if (!is.null(ss)) incl <- .rename_rs(attr(ss, "riskset"))
+	if (is.null(incl) || !all(c("actor1", "actor2") %in% names(incl)))
+		incl <- reh$riskset_info$included
 	D_incl <- nrow(incl)
 
 	if (D_s > 0L && D_s != D_incl)

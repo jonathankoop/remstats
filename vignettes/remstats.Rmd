@@ -28,6 +28,8 @@ Meijerink-Bosman, M., Back, M., Geukes, K., Leenders, R., & Mulder, J. (2023). D
 
 </i>
 
+`remstats` is part of the `remverse` ecosystem for relational event modeling; if you want the full toolchain, see the `remverse` package.
+
 ---
 
 ## Introduction 

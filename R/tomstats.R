@@ -485,6 +485,19 @@ tomstats <- function(
 	# typed riskset ids should be 0..D_typed-1
 	stopifnot(max(riskset[,4]) == nrow(riskset) - 1L)
 
+	# One vectorised key -> riskset-row lookup for the whole edgelist.
+	#
+	# This used to sit inside the row loop. key_to_base[keys] is character
+	# indexing into a NAMED vector of length D_base, and R hashes the names on
+	# every call, so each row cost O(D_base) string comparisons -- making the
+	# loop O(M * D_base). Hoisted it is O(D_base + E), once.
+	if (!sample_untyped && C > 1L && ncol(edgelist) >= 4L) {
+		all_keys <- make_key_typed(edgelist[, 2], edgelist[, 3], edgelist[, 4])
+	} else {
+		all_keys <- make_key_untyped(edgelist[, 2], edgelist[, 3])
+	}
+	all_case_ids <- as.integer(unname(key_to_base[all_keys]) - 1L)
+
 	# ---- sample_map, case_pos, pi, log_pi ----
 	# sample_map is 0-based, indexes sample_riskset (untyped when sample_untyped=TRUE)
 	sample_map <- matrix(NA_integer_, nrow = M, ncol = samp_num)
@@ -494,16 +507,7 @@ tomstats <- function(
 
 	for (m in seq_len(M)) {
 		ev_idx <- events_by_row[[m]]
-		if (sample_untyped) {
-			# Use 0-based actor IDs from the prepared edgelist matrix (cols 2,3)
-			# to match the 0-based integer keys built from sample_riskset.
-			keys <- make_key_untyped(edgelist[ev_idx, 2], edgelist[ev_idx, 3])
-		} else if (C > 1L && ncol(edgelist) >= 4L) {
-			keys <- make_key_typed(edgelist[ev_idx, 2], edgelist[ev_idx, 3], edgelist[ev_idx, 4])
-		} else {
-			keys <- make_key_untyped(edgelist[ev_idx, 2], edgelist[ev_idx, 3])
-		}
-		cases_all <- as.integer(unname(key_to_base[keys]) - 1L)
+		cases_all <- all_case_ids[ev_idx]
 		tab <- table(cases_all)
 		cases <- as.integer(names(tab))          # unique case dyads (0-based)
 		case_mult[[m]] <- as.integer(tab)        # multiplicities
@@ -518,8 +522,32 @@ tomstats <- function(
 
 		c_m <- samp_num - m_t
 		if (c_m > 0L) {
-			pool     <- setdiff(0:(D_base - 1L), cases)
-			controls <- sample(pool, size = c_m, replace = FALSE)
+			if (D_base > 10000L) {
+				# Large risk set: draw controls by rejection instead of materialising
+				# the pool. setdiff(0:(D_base-1L), cases) plus sample() on the result
+				# is several O(D_base) passes and ~3 vector allocations of D_base
+				# integers PER ROW, to select samp_num - m_t ids. Rejection is
+				# O(c_m) and rejects essentially never fire since m_t << D_base.
+				#
+				# Same design: still a uniform simple random sample without
+				# replacement from the non-case dyads, so pi_ctrl is unchanged. The
+				# procedure is symmetric in the non-case labels and returns a fixed
+				# size, which is exactly SRSWOR.
+				controls <- integer(0)
+				repeat {
+					need <- c_m - length(controls)
+					draw <- sample.int(D_base, size = need + 8L, replace = TRUE) - 1L
+					controls <- unique(c(controls, draw[!(draw %in% cases)]))
+					if (length(controls) >= c_m) break
+				}
+				controls <- controls[seq_len(c_m)]
+			} else {
+				# Small risk set: keep the exact original path. Rejection degrades
+				# when c_m is a large fraction of D_base, and this preserves the RNG
+				# stream for the test fixtures.
+				pool     <- setdiff(0:(D_base - 1L), cases)
+				controls <- sample(pool, size = c_m, replace = FALSE)
+			}
 			S_m      <- c(cases, controls)
 			pi_ctrl  <- c_m / (D_base - m_t)
 			pi_m     <- c(rep(1, m_t), rep(pi_ctrl, c_m))

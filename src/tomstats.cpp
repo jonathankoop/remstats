@@ -6,10 +6,59 @@
 #include <iostream>
 #include <map>
 #include <string>
+#include <algorithm> // std::lower_bound, std::min
 
 // [[Rcpp::depends(RcppArmadillo)]]
 // [[Rcpp::interfaces(r, cpp)]]
 // [[Rcpp::depends(RcppProgress)]]
+
+/* ---------------------------------------------------------------------------
+   Time-window helpers.
+
+   The edgelist is sorted by time (column 0), as guaranteed by remify. Every
+   set of "events in a time window" that the statistics need is therefore a
+   contiguous range of rows, and its boundaries can be located with a binary
+   search in O(log m) rather than by scanning the whole time column with
+   arma::find() in O(m). Since these lookups happen once per time point, this
+   turns an O(M*m) cost into O(M log m).
+
+   lower_bound_time(edgelist, t) returns the index of the first event whose
+   time is >= t (== edgelist.n_rows if there is none), so that
+
+     find(col0 >= a && col0 < b)  ==  [lower_bound(a), lower_bound(b))
+     find(col0 < b)               ==  [0, lower_bound(b))
+--------------------------------------------------------------------------- */
+
+inline arma::uword lower_bound_time(const arma::mat &edgelist, double t)
+{
+  const double *first = edgelist.colptr(0);
+  const double *last = first + edgelist.n_rows;
+  return static_cast<arma::uword>(std::lower_bound(first, last, t) - first);
+}
+
+inline arma::uvec index_range(arma::uword lo, arma::uword hi)
+{
+  if (hi <= lo)
+  {
+    return arma::uvec();
+  }
+  return arma::regspace<arma::uvec>(lo, hi - 1);
+}
+
+// Guard the assumption above. This is a single O(m) pass at the entry points,
+// negligible next to the statistics themselves, and it fails loudly rather
+// than silently returning wrong windows if an unsorted edgelist ever arrives.
+inline void check_edgelist_sorted(const arma::mat &edgelist)
+{
+  const double *t = edgelist.colptr(0);
+  for (arma::uword i = 1; i < edgelist.n_rows; ++i)
+  {
+    if (t[i] < t[i - 1])
+    {
+      Rcpp::stop("The edgelist must be sorted by time.");
+    }
+  }
+}
 
 /* get_riskset
 
@@ -153,7 +202,8 @@ arma::uvec inertia_event_indices(const arma::mat &edgelist,
       }
 
       // Events that happened since the previous time point
-      event_indices = arma::find(edgelist.col(0) >= previous_time && edgelist.col(0) < current_time);
+      event_indices = index_range(lower_bound_time(edgelist, previous_time),
+                                  lower_bound_time(edgelist, current_time));
     }
     else if (method == "pe")
     {
@@ -176,15 +226,15 @@ arma::uvec inertia_event_indices(const arma::mat &edgelist,
     double min_time = current_time - memory_value(1);
     double max_time = current_time - memory_value(0);
     // Only update with events that happened between two time points
-    event_indices = arma::find(edgelist.col(0) >= min_time &&
-                               edgelist.col(0) < max_time);
+    event_indices = index_range(lower_bound_time(edgelist, min_time),
+                                lower_bound_time(edgelist, max_time));
   }
   else if (memory == "decay")
   {
     if (method == "pt")
     {
       // Update with events that happened before the current time
-      event_indices = arma::find(edgelist.col(0) < current_time);
+      event_indices = index_range(0, lower_bound_time(edgelist, current_time));
     }
     else if (method == "pe")
     {
@@ -222,6 +272,40 @@ arma::vec get_decay_weights(double previous_time,
   }
 
   return decay_weights;
+}
+
+/* update_inertia_decay
+
+Adds a set of events to row i with decay weights applied.
+
+Equivalent to get_decay_weights() followed by update_inertia(), but without
+materialising a copy of the full length-m weight vector on every time point.
+The arithmetic is deliberately identical: weight * exp(-(reference - t_e) * lambda).
+*/
+void update_inertia_decay(const arma::uvec &event_indices, int i,
+                          arma::mat &inertia,
+                          const arma::mat &edgelist,
+                          const arma::mat &risksetMatrix,
+                          int N, int C,
+                          const arma::vec &weights,
+                          double reference_time, double mem_val)
+{
+  const double lambda = log(2) / mem_val;
+  for (arma::uword j = 0; j < event_indices.n_elem; ++j)
+  {
+    arma::uword event = event_indices(j);
+    int actor1 = edgelist(event, 1);
+    int actor2 = edgelist(event, 2);
+    int event_type = 0;
+    if (C > 1)
+    {
+      event_type = edgelist(event, 3);
+    }
+    int dyad_id = (int)risksetMatrix(actor1, actor2 + (N * event_type));
+    if (dyad_id < 0) continue; // skip events not in riskset (sentinel = -999)
+    inertia(i, (arma::uword)dyad_id) +=
+        weights(event) * exp(-(reference_time - edgelist(event, 0)) * lambda);
+  }
 }
 
 void update_inertia(arma::uvec event_indices, int i,
@@ -279,6 +363,9 @@ arma::mat calculate_inertia(const arma::mat &edgelist,
     Rcpp::Rcout << "Calculating inertia statistic/building block" << std::endl;
   }
 
+  // The time-window lookups below assume a time-sorted edgelist
+  check_edgelist_sorted(edgelist);
+
   // Time points: Depending on the method, get ...
   arma::vec time_points;
   if (method == "pt")
@@ -302,6 +389,9 @@ arma::mat calculate_inertia(const arma::mat &edgelist,
 
   // Progress bar
   Progress p(time_points.n_elem, display_progress);
+
+  // Reference time used by the decay kernel on the previous iteration
+  double prev_reference_time = 0;
 
   // Calculate inertia
   for (arma::uword i = 0; i < time_points.n_elem; ++i)
@@ -347,11 +437,45 @@ arma::mat calculate_inertia(const arma::mat &edgelist,
         previous_time = time_points(i - 1);
       }
 
-      // Update decay weights
-      arma::vec decay_weights = get_decay_weights(previous_time, event_indices, weights, edgelist, memory_value(0));
+      if (i == 0)
+      {
+        // First row: accumulate the whole relevant past.
+        update_inertia_decay(event_indices, i, inertia, edgelist, risksetMatrix,
+                             N, C, weights, previous_time, memory_value(0));
+      }
+      else
+      {
+        /* The decay kernel is multiplicative in elapsed time:
 
-      // Update inertia
-      update_inertia(event_indices, i, inertia, edgelist, risksetMatrix, N, C, decay_weights);
+             w * exp(-(P_i - t_e) * L)
+               = exp(-(P_i - P_{i-1}) * L) * [ w * exp(-(P_{i-1} - t_e) * L) ]
+
+           so the part of row i that row i-1 already accounts for is just row
+           i-1 rescaled by one scalar. Only the events that entered the window
+           since the previous time point still have to be accumulated, instead
+           of re-walking the entire history on every time point. */
+        double scale = exp(-(previous_time - prev_reference_time) *
+                           (log(2) / memory_value(0)));
+        inertia.row(i) = scale * inertia.row(i - 1);
+
+        // Events added to the window since the previous time point
+        arma::uvec new_events;
+        if (method == "pt")
+        {
+          new_events = index_range(lower_bound_time(edgelist, time_points(i - 1)),
+                                   lower_bound_time(edgelist, time_points(i)));
+        }
+        else if (method == "pe")
+        {
+          new_events.set_size(1);
+          new_events(0) = i - 1;
+        }
+
+        update_inertia_decay(new_events, i, inertia, edgelist, risksetMatrix,
+                             N, C, weights, previous_time, memory_value(0));
+      }
+
+      prev_reference_time = previous_time;
     }
 
     p.increment();
@@ -464,8 +588,7 @@ arma::mat calculate_degree_actor(int type, const arma::mat &inertia,
 
   // Declare variables
   arma::vec dyads_col, dyads;
-  arma::uvec exist, indices;
-  arma::mat actor_inertia;
+  arma::uvec exist;
   arma::vec actor_degree;
   arma::vec saving_dyads;
 
@@ -487,9 +610,13 @@ arma::mat calculate_degree_actor(int type, const arma::mat &inertia,
         dyads = dyads_col.elem(exist);
 
         // Compute actor i's indegree for each timepoint
-        indices = arma::conv_to<arma::uvec>::from(dyads);
-        actor_inertia = inertia.cols(indices);
-        actor_degree = sum(actor_inertia, 1);
+        // Accumulate the relevant inertia columns in place. inertia.cols()
+        // materialised an M x N copy for every (actor, event type) pair.
+        actor_degree.zeros(inertia.n_rows);
+        for (arma::uword q = 0; q < dyads.n_elem; ++q)
+        {
+          actor_degree += inertia.col(static_cast<arma::uword>(dyads(q)));
+        }
 
         // Find the dyads in which actor i is the receiver
         if (type == 2 || type == 6)
@@ -546,9 +673,13 @@ arma::mat calculate_degree_actor(int type, const arma::mat &inertia,
         dyads = dyads_col.elem(exist);
 
         // Compute actor i's outdegree for each timepoint
-        indices = arma::conv_to<arma::uvec>::from(dyads);
-        actor_inertia = inertia.cols(indices);
-        actor_degree = sum(actor_inertia, 1);
+        // Accumulate the relevant inertia columns in place. inertia.cols()
+        // materialised an M x N copy for every (actor, event type) pair.
+        actor_degree.zeros(inertia.n_rows);
+        for (arma::uword q = 0; q < dyads.n_elem; ++q)
+        {
+          actor_degree += inertia.col(static_cast<arma::uword>(dyads(q)));
+        }
 
         // Find the dyads in which actor i is the sender
         if (type == 3 || type == 5)
@@ -753,6 +884,11 @@ arma::mat calculate_triad(int type, const arma::mat &inertia,
   arma::uword N = risksetMatrix.n_rows;
   arma::uword C = risksetMatrix.n_cols / N;
 
+  // Evaluate the scaling once. Comparing an Rcpp::String is not free, and the
+  // test was previously repeated in the innermost loop.
+  const bool unique_partners =
+      (scaling == "none_unique") || (scaling == "std_unique");
+
   // Progress bar
   Progress p(N, display_progress);
 
@@ -834,23 +970,31 @@ arma::mat calculate_triad(int type, const arma::mat &inertia,
             }
 
             // get path events
-            if (path1_dyad < 0)
+            if (path1_dyad < 0 || path2_dyad < 0)
               continue;
-            arma::mat path1_events = inertia.col(path1_dyad);
-            if (path2_dyad < 0)
-              continue;
-            arma::mat path2_events = inertia.col(path2_dyad);
-            // join
-            arma::mat events = join_rows(path1_events, path2_events);
-            // convert elements to 1 if greater than 0
-            if ((scaling == "none_unique") || (scaling == "std_unique"))
+
+            // Accumulate this third actor's contribution straight into the
+            // statistic. The previous join_rows / conv_to / min / += sequence
+            // allocated three temporaries per (sender, receiver, type, h).
             {
-              events = arma::conv_to<arma::mat>::from(events > 0);
+              const double *p1 = inertia.colptr(static_cast<arma::uword>(path1_dyad));
+              const double *p2 = inertia.colptr(static_cast<arma::uword>(path2_dyad));
+              double *out = triad.colptr(static_cast<arma::uword>(this_dyad));
+              if (unique_partners)
+              {
+                for (arma::uword m = 0; m < inertia.n_rows; ++m)
+                {
+                  out[m] += (p1[m] > 0 && p2[m] > 0) ? 1.0 : 0.0;
+                }
+              }
+              else
+              {
+                for (arma::uword m = 0; m < inertia.n_rows; ++m)
+                {
+                  out[m] += std::min(p1[m], p2[m]);
+                }
+              }
             }
-            // compute the minimum
-            arma::vec stat = min(events, 1);
-            // save
-            triad.col(this_dyad) += stat;
           }
         }
       }
@@ -862,6 +1006,8 @@ arma::mat calculate_triad(int type, const arma::mat &inertia,
   {
     // Declare variables
     arma::vec path1_dyads(C), path2_dyads(C);
+    // Type-aggregated path counts, hoisted out of the loops
+    arma::vec path1_events(inertia.n_rows), path2_events(inertia.n_rows);
 
     // Loop over 'senders'
     for (arma::uword s = 0; s < N; ++s)
@@ -954,35 +1100,44 @@ arma::mat calculate_triad(int type, const arma::mat &inertia,
               }
             }
 
-            // Loop over event types
-            arma::mat path1_events(inertia.n_rows, 1);
-            arma::mat path2_events(inertia.n_rows, 1);
-
+            // Aggregate the type slices of each path. Note that these two
+            // accumulators were previously declared without fill::zeros and
+            // then accumulated into.
+            path1_events.zeros();
+            path2_events.zeros();
             for (arma::uword k = 0; k < C; ++k)
             {
               // get path events
               if (path1_dyads(k) >= 0)
               {
-                path1_events += inertia.col(path1_dyads(k));
+                path1_events += inertia.col(static_cast<arma::uword>(path1_dyads(k)));
               }
               if (path2_dyads(k) >= 0)
               {
-                path2_events += inertia.col(path2_dyads(k));
+                path2_events += inertia.col(static_cast<arma::uword>(path2_dyads(k)));
               }
             }
 
-            // join
-            arma::mat events = join_rows(path1_events, path2_events);
-
-            // convert elements to 1 if greater than 0
-            if ((scaling == "none_unique") || (scaling == "std_unique"))
+            // Accumulate straight into the statistic, as above
             {
-              events = arma::conv_to<arma::mat>::from(events > 0);
+              const double *p1 = path1_events.memptr();
+              const double *p2 = path2_events.memptr();
+              double *out = triad.colptr(static_cast<arma::uword>(this_dyad));
+              if (unique_partners)
+              {
+                for (arma::uword m = 0; m < inertia.n_rows; ++m)
+                {
+                  out[m] += (p1[m] > 0 && p2[m] > 0) ? 1.0 : 0.0;
+                }
+              }
+              else
+              {
+                for (arma::uword m = 0; m < inertia.n_rows; ++m)
+                {
+                  out[m] += std::min(p1[m], p2[m]);
+                }
+              }
             }
-            // compute the minimum
-            arma::vec stat = min(events, 1);
-            // save
-            triad.col(this_dyad) += stat;
           }
         }
       }
@@ -1027,19 +1182,19 @@ arma::uvec pshift_event_indices(const arma::mat &edgelist,
   {
 
     // Only compute with events that happened since the previous time point
-    event_indices = arma::find(edgelist.col(0) >= previous_time &&
-                               edgelist.col(0) < current_time);
+    event_indices = index_range(lower_bound_time(edgelist, previous_time),
+                                lower_bound_time(edgelist, current_time));
   }
   else if (method == "pe")
   {
     if (i == 0)
     {
-      event_indices = arma::find(edgelist.col(0) < current_time);
-      if (event_indices.n_elem > 0)
+      // Only the last event before the current time
+      arma::uword n_past = lower_bound_time(edgelist, current_time);
+      if (n_past > 0)
       {
-        int last_event = arma::max(event_indices);
         event_indices.set_size(1);
-        event_indices(0) = last_event;
+        event_indices(0) = n_past - 1;
       }
     }
     else
@@ -1379,7 +1534,7 @@ arma::mat calculate_recency(std::string type, const arma::mat &edgelist,
 
   // Select the events in the past to initialize 'lastActive'
   double first_time = edgelist(start, 0);
-  arma::uvec event_indices = arma::find(edgelist.col(0) < first_time);
+  arma::uvec event_indices = index_range(0, lower_bound_time(edgelist, first_time));
 
   // For loop over the past
   for (arma::uword m = 0; m < event_indices.n_elem; ++m)
@@ -1513,8 +1668,8 @@ arma::mat calculate_recency(std::string type, const arma::mat &edgelist,
       {
         next_time = current_time;
       }
-      event_indices = arma::find(edgelist.col(0) >= current_time &&
-                                 edgelist.col(0) < next_time);
+      event_indices = index_range(lower_bound_time(edgelist, current_time),
+                                  lower_bound_time(edgelist, next_time));
     }
     else if (method == "pe")
     {
@@ -1688,7 +1843,7 @@ arma::mat calculate_rrank(int type, const arma::mat &edgelist,
 
   // Select the events in the past to initialize 'lastActive'
   double first_time = edgelist(start, 0);
-  arma::uvec event_indices = arma::find(edgelist.col(0) < first_time);
+  arma::uvec event_indices = index_range(0, lower_bound_time(edgelist, first_time));
 
   // Initialize lastTime array
   arma::cube lastTime(N, N, C);
@@ -1773,8 +1928,8 @@ arma::mat calculate_rrank(int type, const arma::mat &edgelist,
       {
         next_time = current_time;
       }
-      event_indices = arma::find(edgelist.col(0) >= current_time &&
-                                 edgelist.col(0) < next_time);
+      event_indices = index_range(lower_bound_time(edgelist, current_time),
+                                  lower_bound_time(edgelist, next_time));
     }
     else if (method == "pe")
     {
@@ -2532,6 +2687,8 @@ arma::cube compute_stats_tie(Rcpp::CharacterVector effects,
                              bool display_progress,
                              Rcpp::String method)
 {
+  // The time-window lookups in the helpers below assume a time-sorted edgelist
+  check_edgelist_sorted(edgelist);
 
   // Time points: Depending on the method, get ...
   arma::vec time_points;

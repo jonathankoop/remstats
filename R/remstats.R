@@ -124,7 +124,16 @@
 #' @param samp_num Integer. Number of dyads to include per event when
 #'   \code{sampling = TRUE}. Must be smaller than or equal to the size of the
 #'   active risk set. Ignored when \code{sampling = FALSE}.
-#'   Only supported for a \code{tie} model.
+#'   Only supported for a \code{tie} model. The observed dyad is always
+#'   included, so \code{samp_num - 1} controls are drawn. Sampling costs
+#'   efficiency but not consistency: for effects that are not too large the
+#'   variance of the sampled estimator is roughly a factor
+#'   \code{samp_num / (samp_num - 1)} larger than that of the estimator based on
+#'   the full risk set, i.e. about 11\% at the default of 10, so a modest number
+#'   of controls already retains most of the information. Increasing
+#'   \code{samp_num} enlarges the statistics array proportionally; sampling more
+#'   events with few controls each is generally a better use of a given
+#'   computational budget than sampling fewer events with many controls.
 #' @param display_progress should a progress bar for the computation of the
 #' endogenous statistics be shown (TRUE) or not (FALSE)?
 #' @param seed Optional integer. Random seed used for dyad sampling. Setting
