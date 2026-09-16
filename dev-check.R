@@ -18,6 +18,7 @@ files <- c(
   "test-endogenous-stats3.R",
   "test-endogenous-stats4.R",               # undirected
   "test-memory.R",                          # full / interval / decay
+  "test-memory-custom.R",                   # custom (tabulated) decay kernel
   "test-remstats-typed-events.R",
   "test-weights.R"
 )

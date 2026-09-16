@@ -12,7 +12,7 @@
   psi_end = 1,
   attr_actors = NULL,
   attr_dyads = NULL,
-  memory = c("full", "window", "decay", "interval"),
+  memory = c("full", "window", "decay", "interval", "custom"),
   memory_value = NA,
   start = 2,
   stop = Inf,
@@ -44,7 +44,9 @@ actors (see Details).}
 
 \item{memory_value}{Numeric value indicating the memory parameter. Default
 is \code{NA}, which is only valid for \code{memory = "full"} (no memory
-parameter required). See `Details'.}
+parameter required). For \code{memory = "custom"}, a function of the lag or
+a table of lags and weights (a data.frame or list with elements \code{lag}
+and \code{weight}, or a two-column matrix). See `Details'.}
 
 \item{display_progress}{should a progress bar for the computation of the
 endogenous statistics be shown (TRUE) or not (FALSE)?}

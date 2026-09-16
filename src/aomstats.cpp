@@ -8,6 +8,7 @@
 #include <iostream>
 #include <map>
 #include <string>
+#include "memory_kernel.h" // CustomKernel (memory = "custom")
 
 using namespace Rcpp;
 
@@ -84,7 +85,7 @@ arma::uvec event_indices_sender(const arma::mat &edgelist,
         event_indices = arma::find(edgelist.col(0) >= min_time &&
                                    edgelist.col(0) < max_time);
     }
-    else if (memory == "decay")
+    else if (memory == "decay" || memory == "custom")
     {
         if (method == "pt")
         {
@@ -103,22 +104,30 @@ arma::uvec event_indices_sender(const arma::mat &edgelist,
     return event_indices;
 }
 
-// Helper function to update decay weights
+// Helper function to update decay weights. memory = "decay" uses the
+// exponential kernel with half-life memory_value(0); memory = "custom" uses
+// the tabulated kernel (built once per statistic, see memory_kernel.h).
 arma::vec update_decay_weights(double previous_time,
                                arma::uvec event_indices,
                                const arma::vec &weights,
                                const arma::mat &edgelist,
-                               double mem_val)
+                               Rcpp::String memory,
+                               const arma::vec &memory_value,
+                               const CustomKernel &kernel)
 {
 
     arma::vec decay_weights = weights;
+    const bool custom = (memory == "custom");
+    const double lambda = custom ? 0.0 : (log(2) / memory_value(0));
 
     for (arma::uword j = 0; j < event_indices.n_elem; ++j)
     {
         arma::uword event = event_indices(j);
         double event_time = edgelist(event, 0);
         double event_weight = weights(event);
-        double decay_weight = event_weight * exp(-(previous_time - event_time) * (log(2) / mem_val)); //* (log(2) / mem_val);
+        double decay_weight = custom
+            ? event_weight * kernel(previous_time - event_time)
+            : event_weight * exp(-(previous_time - event_time) * lambda);
 
         decay_weights(event) = decay_weight;
     }
@@ -179,6 +188,13 @@ arma::mat degree_sender(std::string type,
     // Initialize the statistic
     arma::mat degree(time_points.n_elem, actors.n_elem, arma::fill::zeros);
 
+    // Tabulated kernel for memory = "custom" (parsed once)
+    CustomKernel kernel;
+    if (memory == "custom")
+    {
+        kernel = CustomKernel(memory_value);
+    }
+
     // Initialize the helper objects
     arma::mat indegree;
     arma::mat outdegree;
@@ -233,7 +249,7 @@ arma::mat degree_sender(std::string type,
                 update_outdegree(outdegree, event_indices, i, edgelist, weights);
             }
         }
-        else if (memory == "decay")
+        else if (memory == "decay" || memory == "custom")
         {
             // Declare the previous event time variable
             double previous_time = 0;
@@ -258,7 +274,7 @@ arma::mat degree_sender(std::string type,
             }
 
             // Update decay weights
-            arma::vec decay_weights = update_decay_weights(previous_time, event_indices, weights, edgelist, memory_value(0));
+            arma::vec decay_weights = update_decay_weights(previous_time, event_indices, weights, edgelist, memory, memory_value, kernel);
 
             // Update the degree
             if ((type == "in") || (type == "total"))
@@ -368,6 +384,13 @@ arma::mat inertia_receiver(const arma::mat &edgelist,
     // Declare the inertia matrix (n x n)
     arma::mat inertia(actors.n_elem, actors.n_elem, arma::fill::zeros);
 
+    // Tabulated kernel for memory = "custom" (parsed once)
+    CustomKernel kernel;
+    if (memory == "custom")
+    {
+        kernel = CustomKernel(memory_value);
+    }
+
     if (memory == "full")
     {
         // Get the past_events
@@ -449,7 +472,7 @@ arma::mat inertia_receiver(const arma::mat &edgelist,
             p.increment();
         }
     }
-    else if (memory == "decay")
+    else if (memory == "decay" || memory == "custom")
     {
         // Get the eventIndices with method is 'pt'
         Rcpp::List eventIndices = getEventIndices(edgelist, start, stop, "pt", "receiver");
@@ -483,7 +506,7 @@ arma::mat inertia_receiver(const arma::mat &edgelist,
             }
 
             // Update decay weights
-            arma::vec decay_weights = update_decay_weights(previous_time, past_events, weights, edgelist, memory_value(0));
+            arma::vec decay_weights = update_decay_weights(previous_time, past_events, weights, edgelist, memory, memory_value, kernel);
 
             // Loop over events to calculate inertia
             for (arma::uword j = 0; j < past_events.n_elem; ++j)
@@ -549,6 +572,13 @@ arma::mat reciprocity_receiver(const arma::mat &edgelist,
     arma::mat stat(stop - start + 1, actors.n_elem, arma::fill::zeros);
     // Declare the reciprocity matrix (n x n)
     arma::mat reciprocity(actors.n_elem, actors.n_elem, arma::fill::zeros);
+
+    // Tabulated kernel for memory = "custom" (parsed once)
+    CustomKernel kernel;
+    if (memory == "custom")
+    {
+        kernel = CustomKernel(memory_value);
+    }
 
     if (memory == "full")
     {
@@ -631,7 +661,7 @@ arma::mat reciprocity_receiver(const arma::mat &edgelist,
             p.increment();
         }
     }
-    else if (memory == "decay")
+    else if (memory == "decay" || memory == "custom")
     {
         // Get the eventIndices with method is 'pt'
         Rcpp::List eventIndices = getEventIndices(edgelist, start, stop, "pt", "receiver");
@@ -665,7 +695,7 @@ arma::mat reciprocity_receiver(const arma::mat &edgelist,
             }
 
             // Update decay weights
-            arma::vec decay_weights = update_decay_weights(previous_time, past_events, weights, edgelist, memory_value(0));
+            arma::vec decay_weights = update_decay_weights(previous_time, past_events, weights, edgelist, memory, memory_value, kernel);
 
             // Loop over events to calculate reciprocity
             for (arma::uword j = 0; j < past_events.n_elem; ++j)
@@ -732,6 +762,13 @@ arma::mat degree_receiver(std::string type,
     // Declare the indegree and outdegree vector (n)
     arma::vec indegree(actors.n_elem, arma::fill::zeros);
     arma::vec outdegree(actors.n_elem, arma::fill::zeros);
+
+    // Tabulated kernel for memory = "custom" (parsed once)
+    CustomKernel kernel;
+    if (memory == "custom")
+    {
+        kernel = CustomKernel(memory_value);
+    }
 
     if (memory == "full")
     {
@@ -848,7 +885,7 @@ arma::mat degree_receiver(std::string type,
             p.increment();
         }
     }
-    else if (memory == "decay")
+    else if (memory == "decay" || memory == "custom")
     {
         // Get the eventIndices with method is 'pt'
         Rcpp::List eventIndices = getEventIndices(edgelist, start, stop, "pt", "receiver");
@@ -883,7 +920,7 @@ arma::mat degree_receiver(std::string type,
             }
 
             // Update decay weights
-            arma::vec decay_weights = update_decay_weights(previous_time, past_events, weights, edgelist, memory_value(0));
+            arma::vec decay_weights = update_decay_weights(previous_time, past_events, weights, edgelist, memory, memory_value, kernel);
 
             // Loop over events to calculate inertia
             for (arma::uword j = 0; j < past_events.n_elem; ++j)
@@ -1000,6 +1037,13 @@ arma::mat triad_receiver(std::string type,
     // Declare the inertia matrix (n x n)
     arma::mat inertia(actors.n_elem, actors.n_elem, arma::fill::zeros);
 
+    // Tabulated kernel for memory = "custom" (parsed once)
+    CustomKernel kernel;
+    if (memory == "custom")
+    {
+        kernel = CustomKernel(memory_value);
+    }
+
     if (memory == "full")
     {
         // Get the past events
@@ -1093,7 +1137,7 @@ arma::mat triad_receiver(std::string type,
             p.increment();
         }
     }
-    else if (memory == "decay")
+    else if (memory == "decay" || memory == "custom")
     {
         // Get the eventIndices with method is 'pt'
         Rcpp::List eventIndices = getEventIndices(edgelist, start, stop, "pt", "receiver");
@@ -1127,7 +1171,7 @@ arma::mat triad_receiver(std::string type,
             }
 
             // Update decay weights
-            arma::vec decay_weights = update_decay_weights(previous_time, past_events, weights, edgelist, memory_value(0));
+            arma::vec decay_weights = update_decay_weights(previous_time, past_events, weights, edgelist, memory, memory_value, kernel);
 
             // Loop over events to calculate inertia
             for (arma::uword j = 0; j < past_events.n_elem; ++j)

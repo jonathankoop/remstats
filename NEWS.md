@@ -1,6 +1,7 @@
 ## remstats 4.1.0
 
 - remstats for stats with duration
+- New memory type `memory = "custom"`: an arbitrary decay function of the lag, supplied through `memory_value` as a function or a table of lags and weights (e.g., a spline-based decay function evaluated on a grid). It weights the same statistics as `memory = "decay"` (inertia, reciprocity, degrees, triads) in the tie-oriented model (full and case-control sampled), the actor-oriented model and the duration model.
 
 ## remstats 4.0.0
 

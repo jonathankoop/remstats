@@ -7,6 +7,7 @@
 #include <map>
 #include <string>
 #include <algorithm> // std::lower_bound, std::min
+#include "memory_kernel.h" // CustomKernel (memory = "custom")
 
 // [[Rcpp::depends(RcppArmadillo)]]
 // [[Rcpp::interfaces(r, cpp)]]
@@ -229,7 +230,7 @@ arma::uvec inertia_event_indices(const arma::mat &edgelist,
     event_indices = index_range(lower_bound_time(edgelist, min_time),
                                 lower_bound_time(edgelist, max_time));
   }
-  else if (memory == "decay")
+  else if (memory == "decay" || memory == "custom")
   {
     if (method == "pt")
     {
@@ -306,6 +307,68 @@ void update_inertia_decay(const arma::uvec &event_indices, int i,
     inertia(i, (arma::uword)dyad_id) +=
         weights(event) * exp(-(reference_time - edgelist(event, 0)) * lambda);
   }
+}
+
+/* update_inertia_custom
+
+Adds a set of events to row i with the weights of a tabulated custom kernel
+applied: weight * kernel(reference - t_e). See memory_kernel.h.
+*/
+void update_inertia_custom(const arma::uvec &event_indices, int i,
+                           arma::mat &inertia,
+                           const arma::mat &edgelist,
+                           const arma::mat &risksetMatrix,
+                           int N, int C,
+                           const arma::vec &weights,
+                           double reference_time,
+                           const CustomKernel &kernel)
+{
+  for (arma::uword j = 0; j < event_indices.n_elem; ++j)
+  {
+    arma::uword event = event_indices(j);
+    int actor1 = edgelist(event, 1);
+    int actor2 = edgelist(event, 2);
+    int event_type = 0;
+    if (C > 1)
+    {
+      event_type = edgelist(event, 3);
+    }
+    int dyad_id = (int)risksetMatrix(actor1, actor2 + (N * event_type));
+    if (dyad_id < 0) continue; // skip events not in riskset (sentinel = -999)
+    inertia(i, (arma::uword)dyad_id) +=
+        weights(event) * kernel(reference_time - edgelist(event, 0));
+  }
+}
+
+/* decay_reference_time
+
+The time the decay/custom kernels measure the lag from at time point i: the
+previous time point, or the last time point before 'start' for the first row.
+*/
+double decay_reference_time(const arma::mat &edgelist,
+                            const arma::vec &time_points,
+                            int start, int i,
+                            Rcpp::String method)
+{
+  double previous_time = 0;
+  if (i == 0 && start > 0)
+  {
+    arma::vec event_times;
+    if (method == "pt")
+    {
+      event_times = arma::unique(edgelist.col(0));
+    }
+    else if (method == "pe")
+    {
+      event_times = edgelist.col(0);
+    }
+    previous_time = arma::max(event_times.subvec(0, start - 1));
+  }
+  else if (i > 0)
+  {
+    previous_time = time_points(i - 1);
+  }
+  return previous_time;
 }
 
 void update_inertia(arma::uvec event_indices, int i,
@@ -393,6 +456,13 @@ arma::mat calculate_inertia(const arma::mat &edgelist,
   // Reference time used by the decay kernel on the previous iteration
   double prev_reference_time = 0;
 
+  // Tabulated kernel for memory = "custom" (parsed once)
+  CustomKernel kernel;
+  if (memory == "custom")
+  {
+    kernel = CustomKernel(memory_value);
+  }
+
   // Calculate inertia
   for (arma::uword i = 0; i < time_points.n_elem; ++i)
   {
@@ -413,29 +483,18 @@ arma::mat calculate_inertia(const arma::mat &edgelist,
     {
       update_inertia(event_indices, i, inertia, edgelist, risksetMatrix, N, C, weights);
     }
+    else if (memory == "custom")
+    {
+      /* A general kernel has no recursive update, so the whole past is
+         re-weighted at every time point: O(M * m) kernel lookups. */
+      double previous_time = decay_reference_time(edgelist, time_points, start, i, method);
+      update_inertia_custom(event_indices, i, inertia, edgelist, risksetMatrix,
+                            N, C, weights, previous_time, kernel);
+    }
     else if (memory == "decay")
     {
-      // Declare the previous event time variable
-      double previous_time = 0;
-      if (i == 0 && start > 0)
-      {
-        // Get the previous event time if start is larger than 0
-        arma::vec event_times;
-        if (method == "pt")
-        {
-          event_times = arma::unique(edgelist.col(0));
-        }
-        else if (method == "pe")
-        {
-          event_times = edgelist.col(0);
-        }
-        previous_time = arma::max(event_times.subvec(0, start - 1));
-      }
-      else if (i > 0)
-      {
-        // Get the previous event time if the index i is larger than 0
-        previous_time = time_points(i - 1);
-      }
+      // Time the lag is measured from
+      double previous_time = decay_reference_time(edgelist, time_points, start, i, method);
 
       if (i == 0)
       {

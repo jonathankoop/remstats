@@ -243,7 +243,7 @@ normalize_reh <- function(reh) {
 # [param] attr_actors (Optional) A data frame containing attribute data for the
 # actors.
 # [param] memory A character vector specifying the memory type, which can be
-# one of "full", "window", "decay", or "interval".
+# one of "full", "window", "decay", "interval", or "custom".
 # [param] memory_value (Optional) The value associated with the memory type.
 # [param] start The starting index of the event history data to consider.
 # [param] stop The ending index of the event history data to consider.
@@ -258,7 +258,7 @@ normalize_reh <- function(reh) {
 # )
 prepare_tomstats <- function(
     effects, reh, attr_actors = NULL,
-    attr_dyads = NULL, memory = c("full", "window", "decay", "interval"),
+    attr_dyads = NULL, memory = c("full", "window", "decay", "interval", "custom"),
     memory_value = NA, start = 1, stop = Inf, method = c("pt", "pe")) {
   # Check if reh is of class remify
   if (!("remify" %in% class(reh))) {
@@ -374,7 +374,8 @@ prepare_tomstats <- function(
 
   # Match memory
   memory <- match.arg(memory)
-  memory_value <- validate_memory(memory, memory_value)
+  memory_value <- validate_memory(memory, memory_value,
+    max_lag = diff(range(edgelist$time)))
   if (memory == "window") {
     # Change memory to interval (window is a special case)
     memory <- "interval"
@@ -556,16 +557,26 @@ check_formula <- function(formula) {
 # 'memory' type.
 #
 # [param] memory The memory type, which can be one of "full", "window",
-# "decay", or "interval".
+# "decay", "interval", or "custom".
 # [param] memory_value The value associated with the memory type.
+# [param] max_lag The largest lag a custom decay function is tabulated for
+# (only used when memory is "custom" and memory_value is a function).
+# [param] n_grid The number of grid points a custom decay function is
+# tabulated on.
 #
-# [return] The validated memory value based on the memory type.
+# [return] The validated memory value based on the memory type. For memory
+# "custom" this is the flattened lag/weight table c(lags, weights) expected by
+# the C++ routines, see prepare_custom_memory().
 #
 # [examples]
 # validated_value <- validate_memory("window", 10)
-validate_memory <- function(memory, memory_value) {
+validate_memory <- function(memory, memory_value, max_lag = NULL,
+                            n_grid = 10000) {
   if (memory == "full") {
     memory_value <- Inf
+  }
+  if (memory == "custom") {
+    memory_value <- prepare_custom_memory(memory_value, max_lag, n_grid)
   }
   if (memory == "window") {
     stopifnot(
@@ -595,6 +606,77 @@ validate_memory <- function(memory, memory_value) {
   }
 
   return(memory_value)
+}
+
+# Tabulate a custom decay function for memory = "custom"
+#
+# With memory = "custom", the weight of a past event in the endogenous
+# statistics is an arbitrary function of the lag (the time elapsed between the
+# past event and the previous time point), supplied through 'memory_value' as
+# either
+#   (a) a function of the lag, which is evaluated on an equally spaced grid of
+#       'n_grid' lags from 0 to 'max_lag', or
+#   (b) a table of lags and weights: a data.frame or list with elements 'lag'
+#       and 'weight', or a two-column matrix (lags in the first column).
+# The C++ routines use the weight at the tabulated lag closest to the observed
+# lag (ties go to the smaller lag) and the weight at the nearest end of the
+# grid for lags outside it, i.e. nearest-neighbour lookup with findInterval().
+#
+# [param] memory_value A function or a lag/weight table, see above.
+# [param] max_lag The largest lag to tabulate a function for.
+# [param] n_grid The number of grid points to tabulate a function on.
+#
+# [return] A numeric vector c(lags, weights), lags sorted increasingly.
+prepare_custom_memory <- function(memory_value, max_lag = NULL,
+                                  n_grid = 10000) {
+  if (is.function(memory_value)) {
+    stopifnot(
+      "A finite non-negative 'max_lag' is needed to tabulate a custom decay function" =
+        is.numeric(max_lag) && length(max_lag) == 1 && is.finite(max_lag) &&
+          max_lag >= 0,
+      "'n_grid' should be a single positive integer" =
+        is.numeric(n_grid) && length(n_grid) == 1 && n_grid >= 1
+    )
+    lag <- seq(0, max_lag, length.out = n_grid)
+    weight <- memory_value(lag)
+  } else if (is.matrix(memory_value)) {
+    stopifnot(
+      "A matrix 'memory_value' should have two columns (lag, weight) when memory is 'custom'" =
+        ncol(memory_value) == 2
+    )
+    cn <- colnames(memory_value)
+    if (!is.null(cn) && all(c("lag", "weight") %in% cn)) {
+      lag <- memory_value[, "lag"]
+      weight <- memory_value[, "weight"]
+    } else {
+      lag <- memory_value[, 1]
+      weight <- memory_value[, 2]
+    }
+  } else if (is.list(memory_value)) {
+    stopifnot(
+      "'memory_value' should contain the elements 'lag' and 'weight' when memory is 'custom'" =
+        all(c("lag", "weight") %in% names(memory_value))
+    )
+    lag <- memory_value[["lag"]]
+    weight <- memory_value[["weight"]]
+  } else {
+    stop("When memory is 'custom', 'memory_value' should be a function of the lag or a table with 'lag' and 'weight' (data.frame, list or two-column matrix)")
+  }
+
+  lag <- as.numeric(lag)
+  weight <- as.numeric(weight)
+  stopifnot(
+    "The custom decay function should give one finite weight per lag" =
+      length(weight) == length(lag) && length(lag) >= 1 &&
+        all(is.finite(weight)),
+    "The lags of the custom decay function should be finite and non-negative" =
+      all(is.finite(lag)) && all(lag >= 0),
+    "The lags of the custom decay function should be unique" =
+      !anyDuplicated(lag)
+  )
+
+  ord <- order(lag)
+  c(lag[ord], weight[ord])
 }
 
 # Get all tie effects

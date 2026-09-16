@@ -12,7 +12,7 @@
   psi_end = 1,
   attr_actors = NULL,
   attr_dyads = NULL,
-  memory = c("full", "window", "decay", "interval"),
+  memory = c("full", "window", "decay", "interval", "custom"),
   memory_value = NA,
   start = 2,
   stop = Inf,

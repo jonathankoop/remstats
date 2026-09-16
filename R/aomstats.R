@@ -37,6 +37,23 @@
 #' the computation of the statistics depend on the elapsed time between $t$ and
 #' the past event. This weight is determined based on an exponential decay
 #' function with half-life parameter `memory_value` (see Brandes et al., 2009).
+#' The fifth option, `memory = "custom"`, generalizes `"decay"` to an
+#' arbitrary decay function: the weight of a past event is `memory_value`
+#' evaluated at the lag, i.e., the time elapsed between the past event and the
+#' previous time point (the same reference time as for `"decay"`). Here
+#' `memory_value` is either a function of the lag, which is tabulated on an
+#' equally spaced grid of 10000 lags between 0 and the largest observed lag,
+#' or a table of lags and weights (a data.frame or list with elements `lag` and
+#' `weight`, or a two-column matrix), for example a spline-based decay function
+#' evaluated on a grid. Each observed lag takes the weight of the tabulated lag
+#' closest to it (lags outside the grid take the weight at the nearest end of
+#' the grid). Since a general decay function cannot be updated recursively,
+#' the whole past is re-weighted at every time point, which is slower than
+#' `"decay"` for long event histories. Both `"decay"` and `"custom"` affect the
+#' same statistics: those that are computed from the (weighted) counts of past
+#' events, i.e., inertia, reciprocity, the degree statistics, and the triadic
+#' statistics; the participation shift, recency and rank statistics do not
+#' depend on the memory weights.
 #'
 #' @section Event weights:
 #' Note that if the relational event history contains a column that is named
@@ -103,7 +120,7 @@
 aomstats <- function(reh,
                      sender_effects = NULL,
                      receiver_effects = NULL,
-                     memory = c("full", "window", "decay", "interval"),
+                     memory = c("full", "window", "decay", "interval", "custom"),
                      memory_value = NA,
                      first = 2,
                      last = Inf,
@@ -138,7 +155,8 @@ aomstats <- function(reh,
 
   # Validate the memory argument
   memory <- match.arg(memory)
-  memory_value <- validate_memory(memory, memory_value)
+  memory_value <- validate_memory(memory, memory_value,
+    max_lag = diff(range(edgelist[, 1])))
   if (memory == "window") {
     # Change memory to interval (window is a special case)
     memory <- "interval"

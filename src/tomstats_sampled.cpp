@@ -8,6 +8,7 @@
 #include <deque>
 #include <cmath>
 #include <map>
+#include "memory_kernel.h" // CustomKernel (memory = "custom")
 
 
 // [[Rcpp::depends(RcppArmadillo)]]
@@ -1115,11 +1116,12 @@ arma::mat calculate_rrank_sampled(int type,
 
 namespace {
 
-enum MemKind { MEM_FULL = 0, MEM_WINDOW, MEM_INTERVAL, MEM_DECAY };
+enum MemKind { MEM_FULL = 0, MEM_WINDOW, MEM_INTERVAL, MEM_DECAY, MEM_CUSTOM };
 
 struct MemSpec {
 	MemKind kind = MEM_FULL;
 	double win_len = 0.0, int_min = 0.0, int_max = 0.0, lambda = 0.0;
+	CustomKernel kernel;   // custom: tabulated weight as a function of the lag
 };
 
 // Resolve the memory string once, up front, so the hot paths branch on an int
@@ -1152,8 +1154,11 @@ static MemSpec parse_memory_spec(Rcpp::String memory,
 		double half_life = memory_value(0);
 		if (half_life <= 0) Rcpp::stop(who + ": decay half-life must be > 0.");
 		ms.lambda = std::log(2.0) / half_life;
+	} else if (memory == "custom") {
+		ms.kind = MEM_CUSTOM;
+		ms.kernel = CustomKernel(memory_value);
 	} else {
-		Rcpp::stop(who + ": memory must be full/window/interval/decay.");
+		Rcpp::stop(who + ": memory must be full/window/interval/decay/custom.");
 	}
 	return ms;
 }
@@ -1162,7 +1167,7 @@ static MemSpec parse_memory_spec(Rcpp::String memory,
 struct DyadHistory {
 	MemSpec ms;
 	std::vector<double> full_sum;                                 // full
-	std::vector<std::deque<std::pair<double, double> > > q_ev;    // window/interval
+	std::vector<std::deque<std::pair<double, double> > > q_ev;    // window/interval/custom
 	std::vector<double> win_sum;                                  // window
 	std::vector<double> dec_state, dec_last_t;                    // decay
 
@@ -1174,6 +1179,7 @@ struct DyadHistory {
 		case MEM_INTERVAL: q_ev.resize((size_t)Q); break;
 		case MEM_DECAY:    dec_state.assign((size_t)Q, 0.0);
 		                   dec_last_t.assign((size_t)Q, NAN); break;
+		case MEM_CUSTOM:   q_ev.resize((size_t)Q); break;
 		}
 	}
 
@@ -1192,6 +1198,7 @@ struct DyadHistory {
 		                   win_sum[(size_t)qi] += w; break;
 		case MEM_INTERVAL: q_ev[(size_t)qi].push_back(std::make_pair(t, w)); break;
 		case MEM_DECAY:    decay_touch(qi, t); dec_state[(size_t)qi] += w; break;
+		case MEM_CUSTOM:   q_ev[(size_t)qi].push_back(std::make_pair(t, w)); break;
 		}
 	}
 
@@ -1218,6 +1225,16 @@ struct DyadHistory {
 			     it != dq.end(); ++it) {
 				if (it->first <= upper) acc += it->second;
 				else break;
+			}
+			return acc;
+		}
+		case MEM_CUSTOM: {
+			// no recursion for a general kernel: re-weight every past event
+			const std::deque<std::pair<double, double> > &dq = q_ev[(size_t)qi];
+			double acc = 0.0;
+			for (std::deque<std::pair<double, double> >::const_iterator it = dq.begin();
+			     it != dq.end(); ++it) {
+				acc += it->second * ms.kernel(t_eval - it->first);
 			}
 			return acc;
 		}
@@ -1537,9 +1554,13 @@ static inline arma::mat normalize_inertia_sampled_prop(
 	std::vector<double> dec_state, dec_last_t;
 	
 	double win_len = 0.0, int_min = 0.0, int_max = 0.0, half_life = 0.0, lambda = 0.0;
-	
+	CustomKernel kernel;   // custom: tabulated weight as a function of the lag
+
 	if (memory == "full") {
 		full_sum.assign(SZ, 0.0);
+	} else if (memory == "custom") {
+		kernel = CustomKernel(memory_value);
+		q.resize(SZ);
 	} else if (memory == "window") {
 		if (memory_value.n_elem < 1) Rcpp::stop("normalize_inertia_sampled_prop: window needs memory_value[1].");
 		win_len = memory_value(0);
@@ -1602,22 +1623,29 @@ static inline arma::mat normalize_inertia_sampled_prop(
 		} else if (memory == "window") {
 			q[idx].push_back({t, w});
 			qsum[idx] += w;
-		} else if (memory == "interval") {
+		} else if (memory == "interval" || memory == "custom") {
 			q[idx].push_back({t, w});
 		} else { // decay
 			decay_touch(idx, t);
 			dec_state[idx] += w;
 		}
 	};
-	
+
 	auto query_deg = [&](int sender, int et, double t_eval) -> double {
 		if (sender < 0 || sender >= N) return 0.0;
 		if (consider_type && (et < 0 || et >= C)) return 0.0;
-		
+
 		const size_t idx = key(sender, et);
-		
+
 		if (memory == "full") return full_sum[idx];
-		
+
+		if (memory == "custom") {
+			// no recursion for a general kernel: re-weight every past event
+			double acc = 0.0;
+			for (const auto &tw : q[idx]) acc += tw.second * kernel(t_eval - tw.first);
+			return acc;
+		}
+
 		if (memory == "window") {
 			prune_window(idx, t_eval);
 			return qsum[idx];
@@ -1744,12 +1772,16 @@ static inline arma::vec past_events_denom(const arma::mat &edgelist,
 	double lambda = 0.0;
 	double last_t = NAN;
 	double state = 0.0;
-	
-	// window / interval
+
+	// custom: tabulated weight as a function of the lag
+	CustomKernel kernel;
+	if (memory == "custom") kernel = CustomKernel(memory_value);
+
+	// window / interval / custom
 	std::deque<std::pair<double,double>> q;
 	double qsum = 0.0;
 	double win_len = 0.0, int_min = 0.0, int_max = 0.0;
-	
+
 	if (memory == "window") {
 		if (memory_value.n_elem < 1) Rcpp::stop("past_events_denom: window needs memory_value[1].");
 		win_len = memory_value(0);
@@ -1779,21 +1811,28 @@ static inline arma::vec past_events_denom(const arma::mat &edgelist,
 		} else if (memory == "window") {
 			q.push_back({t,w});
 			qsum += w;
-		} else if (memory == "interval") {
+		} else if (memory == "interval" || memory == "custom") {
 			q.push_back({t,w});
 		} else {
 			Rcpp::stop("past_events_denom: unknown memory.");
 		}
 	};
-	
+
 	auto query = [&](double t_eval)->double{
 		if (memory == "full") return state;
-		
+
 		if (memory == "decay") {
 			decay_touch(t_eval);
 			return state;
 		}
-		
+
+		if (memory == "custom") {
+			// no recursion for a general kernel: re-weight every past event
+			double acc = 0.0;
+			for (const auto &tw : q) acc += tw.second * kernel(t_eval - tw.first);
+			return acc;
+		}
+
 		if (memory == "window") {
 			const double cutoff = t_eval - win_len;
 			while (!q.empty() && q.front().first < cutoff) {
@@ -1950,8 +1989,8 @@ arma::mat calculate_degree_actor_sampled(int type,                  // 1..6 as i
 	if (!(method == "pt" || method == "pe"))
 		Rcpp::stop("calculate_degree_actor_sampled: method must be 'pt' or 'pe'.");
 	
-	if (!(memory == "full" || memory == "window" || memory == "interval" || memory == "decay"))
-		Rcpp::stop("calculate_degree_actor_sampled: memory must be full/window/interval/decay.");
+	if (!(memory == "full" || memory == "window" || memory == "interval" || memory == "decay" || memory == "custom"))
+		Rcpp::stop("calculate_degree_actor_sampled: memory must be full/window/interval/decay/custom.");
 	
 	if ((arma::uword)edgelist.n_rows != (arma::uword)weights.n_elem)
 		Rcpp::stop("calculate_degree_actor_sampled: weights length must equal edgelist.n_rows.");
@@ -2019,12 +2058,18 @@ arma::mat calculate_degree_actor_sampled(int type,                  // 1..6 as i
 		lt = t_now;
 	};
 	
-	// ---- window / interval queues ----
+	// ---- custom kernel (tabulated weight as a function of the lag) ----
+	CustomKernel kernel;
+	if (memory == "custom") kernel = CustomKernel(memory_value);
+
+	// ---- window / interval / custom queues ----
 	std::vector<std::deque<std::pair<double,double>>> q;
 	std::vector<double> qsum;
 	double win_len = 0.0, int_min = 0.0, int_max = 0.0;
-	
-	if (memory == "window") {
+
+	if (memory == "custom") {
+		q.resize(SZ);
+	} else if (memory == "window") {
 		if (memory_value.n_elem < 1)
 			Rcpp::stop("calculate_degree_actor_sampled: window requires memory_value length 1.");
 		win_len = memory_value(0);
@@ -2051,18 +2096,25 @@ arma::mat calculate_degree_actor_sampled(int type,                  // 1..6 as i
 		if (memory == "full") state[idx] += w;
 		else if (memory == "decay") { decay_touch(idx, t); state[idx] += w; }
 		else if (memory == "window") { q[idx].push_back({t, w}); qsum[idx] += w; }
-		else { q[idx].push_back({t, w}); } // interval
+		else { q[idx].push_back({t, w}); } // interval / custom
 	};
-	
+
 	auto query_state = [&](int actor, int et, double t_eval) -> double {
 		if (actor < 0 || actor >= N) return 0.0;
 		if (consider_type && (et < 0 || et >= C)) return 0.0;
-		
+
 		size_t idx = key(actor, et);
-		
+
 		if (memory == "full") return state[idx];
 		if (memory == "decay") { decay_touch(idx, t_eval); return state[idx]; }
-		
+
+		if (memory == "custom") {
+			// no recursion for a general kernel: re-weight every past event
+			double acc = 0.0;
+			for (auto &tw : q[idx]) acc += tw.second * kernel(t_eval - tw.first);
+			return acc;
+		}
+
 		if (memory == "window") {
 			double cutoff = t_eval - win_len;
 			auto &dq = q[idx];
@@ -2223,8 +2275,8 @@ arma::mat calculate_triad_sampled(int type,                      // 1..5 as in c
 	if (!(type >= 1 && type <= 5)) Rcpp::stop("calculate_triad_sampled: type must be 1..5.");
 	if (riskset.n_cols < 4) Rcpp::stop("calculate_triad_sampled: riskset must have >=4 cols.");
 	if (!(method == "pt" || method == "pe")) Rcpp::stop("calculate_triad_sampled: method must be 'pt' or 'pe'.");
-	if (!(memory == "full" || memory == "window" || memory == "interval" || memory == "decay"))
-		Rcpp::stop("calculate_triad_sampled: memory must be full/window/interval/decay.");
+	if (!(memory == "full" || memory == "window" || memory == "interval" || memory == "decay" || memory == "custom"))
+		Rcpp::stop("calculate_triad_sampled: memory must be full/window/interval/decay/custom.");
 	if ((arma::uword)edgelist.n_rows != (arma::uword)weights.n_elem)
 		Rcpp::stop("calculate_triad_sampled: weights length must equal edgelist.n_rows.");
 	
@@ -2288,6 +2340,7 @@ arma::mat calculate_triad_sampled(int type,                      // 1..5 as in c
 		case MEM_DECAY:    decay_touch(idx, t); state[idx] += w; break;
 		case MEM_WINDOW:   q[dyad].push_back({t,w}); qsum[dyad] += w; break;
 		case MEM_INTERVAL: q[dyad].push_back({t,w}); break;
+		case MEM_CUSTOM:   q[dyad].push_back({t,w}); break;
 		}
 	};
 
@@ -2300,6 +2353,13 @@ arma::mat calculate_triad_sampled(int type,                      // 1..5 as in c
 		auto it = q.find(dyad);
 		if (it == q.end()) return 0.0;
 		auto &dq = it->second;
+
+		if (ms.kind == MEM_CUSTOM) {
+			// no recursion for a general kernel: re-weight every past event
+			double acc = 0.0;
+			for (auto &tw : dq) acc += tw.second * ms.kernel(now - tw.first);
+			return acc;
+		}
 
 		if (ms.kind == MEM_WINDOW) {
 			// NB: "<=" here, "<" in the inertia/reciprocity accumulator. Kept as
